@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-class ImageQAAgent:
+class LLM:
     """
     A class that uses OpenAI Vision models via LangChain
     to answer questions based on multiple images.

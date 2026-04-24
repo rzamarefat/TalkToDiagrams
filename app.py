@@ -1,12 +1,12 @@
-from LLM import ImageQAAgent
+from LLM import LLM
 
 
 
 if __name__ == "__main__":
-    agent = ImageQAAgent(model="gpt-4o-mini")
+    agent = LLM(model="gpt-4o-mini")
 
     images = [
-        r"C:\Users\User1\Desktop\internal\TalkToDiagrams\assets\PlotMultipleLinesExample_01.png"
+        r".\assets\PlotMultipleLinesExample_01.png"
     ]
 
     question = "You can see a plot in the provided image. please give me a detailed explanation of the curves and the figures."
