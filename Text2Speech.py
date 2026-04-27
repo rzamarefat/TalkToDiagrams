@@ -18,7 +18,7 @@ print("We have loaded the tokeniser/detokeniser model to the cpu, to use vram - 
 
 tokeniser_name = "meta-llama/Llama-3.2-3B-Instruct"
 
-model_name = r"C:\Users\User1\Desktop\internal\TalkToDiagrams\ckpt"
+model_name = r".\ckpt"
 
 model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
 model.cuda()

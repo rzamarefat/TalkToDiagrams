@@ -71,6 +71,22 @@ class LLM:
             }
         }
 
+    def ask_stream(self, question: str, images: List[Union[str, dict]]):
+        image_parts = [self._prepare_image(img) for img in images]
+
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": question},
+                *image_parts
+            ]
+        )
+
+        stream = self.llm.stream([message])
+
+        for chunk in stream:
+            if chunk.content:
+                yield chunk.content
+
     def ask(self, question: str, images: List[Union[str, dict]]) -> str:
         """
         Ask a question based on multiple images.
