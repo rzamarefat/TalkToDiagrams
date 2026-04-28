@@ -1,0 +1,6 @@
+assets
+.env
+__pycache__
+ckpt
+test.ipynb
+README.md
