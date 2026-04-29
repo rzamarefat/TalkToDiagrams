@@ -32,8 +32,11 @@ export default function Home() {
   const [imageInput, setImageInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [, forceUpdate] = useState(0); // used to re-render when pendingAudioRef changes
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+  const pendingAudioRef = useRef<Blob | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId)!;
@@ -67,30 +70,12 @@ export default function Home() {
     }
   };
 
-  const handleSubmit = async () => {
-    if (!question.trim()) return;
-
-    const userMessage: Message = { role: "user", content: question };
-    const tabId = activeTabId;
-
-    updateTab(tabId, (t) => ({
-      ...t,
-      messages: [...t.messages, userMessage, { role: "assistant", content: "" }],
-    }));
-
-    setQuestion("");
-    setLoading(true);
-
+  const streamResponse = async (
+    tabId: string,
+    fetchCall: () => Promise<Response>
+  ) => {
     try {
-      const res = await fetch("http://localhost:5000/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question,
-          images: activeTab.images,
-        }),
-      });
-
+      const res = await fetchCall();
       if (!res.body) throw new Error("No response body");
 
       const reader = res.body.getReader();
@@ -112,9 +97,55 @@ export default function Home() {
     } catch {
       updateTab(tabId, (t) => {
         const updated = [...t.messages];
-        updated[updated.length - 1] = { role: "assistant", content: "Error connecting to backend." };
+        updated[updated.length - 1] = {
+          role: "assistant",
+          content: "Error connecting to backend.",
+        };
         return { ...t, messages: updated };
       });
+    }
+  };
+
+  const handleSubmit = async () => {
+    const audioBlob = pendingAudioRef.current;
+    if (!question.trim() && !audioBlob) return;
+
+    const displayText = question.trim() || "🎤 Voice message";
+    const userMessage: Message = { role: "user", content: displayText };
+    const tabId = activeTabId;
+    const currentImages = activeTab.images;
+    const currentQuestion = question;
+
+    // Clear state immediately
+    pendingAudioRef.current = null;
+    setQuestion("");
+    forceUpdate((n) => n + 1);
+
+    updateTab(tabId, (t) => ({
+      ...t,
+      messages: [...t.messages, userMessage, { role: "assistant", content: "" }],
+    }));
+
+    setLoading(true);
+
+    if (audioBlob) {
+      // Multipart POST: backend transcribes audio first, then streams LLM response
+      await streamResponse(tabId, () => {
+        const form = new FormData();
+        form.append("question", currentQuestion);
+        currentImages.forEach((img) => form.append("images", img));
+        form.append("audio", audioBlob, "recording.webm");
+        return fetch("http://localhost:5000/analyze", { method: "POST", body: form });
+      });
+    } else {
+      // Plain JSON POST: no audio
+      await streamResponse(tabId, () =>
+        fetch("http://localhost:5000/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: currentQuestion, images: currentImages }),
+        })
+      );
     }
 
     setLoading(false);
@@ -173,21 +204,29 @@ export default function Home() {
     });
   };
 
+  const discardAudio = () => {
+    pendingAudioRef.current = null;
+    forceUpdate((n) => n + 1);
+  };
+
   const toggleRecording = async () => {
     if (recording) {
+      // Stop — onstop handler saves blob into pendingAudioRef
       mediaRecorderRef.current?.stop();
-      setRecording(false);
       return;
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mr = new MediaRecorder(stream);
-      const chunks: BlobPart[] = [];
-      mr.ondataavailable = (e) => chunks.push(e.data);
+      chunksRef.current = [];
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
       mr.onstop = () => {
         stream.getTracks().forEach((t) => t.stop());
-        // Voice recording placeholder — wire to your STT endpoint
-        console.log("Recording stopped, blob ready:", new Blob(chunks, { type: "audio/webm" }));
+        pendingAudioRef.current = new Blob(chunksRef.current, { type: "audio/webm" });
+        setRecording(false);
+        forceUpdate((n) => n + 1); // show the badge
       };
       mr.start();
       mediaRecorderRef.current = mr;
@@ -196,6 +235,9 @@ export default function Home() {
       alert("Microphone access denied.");
     }
   };
+
+  const hasPendingAudio = !!pendingAudioRef.current;
+  const canSend = (question.trim().length > 0 || hasPendingAudio) && !loading && !recording;
 
   return (
     <div
@@ -299,6 +341,7 @@ export default function Home() {
 
       {/* ── Two-Column Body ── */}
       <div style={{ flex: 1, display: "flex", overflow: "hidden", padding: "16px", gap: "16px" }}>
+
         {/* ── LEFT: Chat ── */}
         <div
           style={{
@@ -421,48 +464,115 @@ export default function Home() {
               gap: "8px",
             }}
           >
+            {/* Pending audio badge */}
+            {hasPendingAudio && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  padding: "6px 10px",
+                  background: "#1a2a1a",
+                  border: "1px solid #2a3a2a",
+                  borderRadius: "8px",
+                  fontSize: "12px",
+                  color: "#6bcf6b",
+                }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </svg>
+                <span>Voice recording ready — will be transcribed on send</span>
+                <button
+                  onClick={discardAudio}
+                  title="Discard recording"
+                  style={{
+                    marginLeft: "auto",
+                    background: "none",
+                    border: "none",
+                    color: "#6bcf6b",
+                    cursor: "pointer",
+                    fontSize: "13px",
+                    padding: "0",
+                    lineHeight: 1,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
             <textarea
-              placeholder="Message…"
+              placeholder={recording ? "Recording…" : "Message… (or record voice below)"}
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               onKeyDown={handleKeyDown}
+              disabled={recording}
               rows={2}
               style={{
                 width: "100%",
-                background: "#1c1c1e",
+                background: recording ? "#1a1a1a" : "#1c1c1e",
                 border: "1px solid #2c2c2e",
                 borderRadius: "10px",
                 padding: "10px 12px",
-                color: "#e5e5e5",
+                color: recording ? "#555" : "#e5e5e5",
                 fontSize: "14px",
                 resize: "none",
                 outline: "none",
                 fontFamily: "inherit",
                 lineHeight: "1.5",
                 boxSizing: "border-box",
+                cursor: recording ? "not-allowed" : "text",
               }}
             />
+
             <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-              {/* Voice button */}
+
+              {/* Mic button */}
               <button
                 onClick={toggleRecording}
+                disabled={loading}
                 title={recording ? "Stop recording" : "Record voice"}
                 style={{
                   width: "38px",
                   height: "38px",
                   borderRadius: "10px",
-                  border: "1px solid #3a3a3c",
+                  border: `1px solid ${recording ? "#5a2a2a" : "#3a3a3c"}`,
                   background: recording ? "#3a1a1a" : "#1c1c1e",
                   color: recording ? "#ff6b6b" : "#aaa",
-                  cursor: "pointer",
+                  cursor: loading ? "not-allowed" : "pointer",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
                   flexShrink: 0,
                   transition: "all 0.15s",
+                  position: "relative",
                 }}
               >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill={recording ? "#ff6b6b" : "none"} stroke="currentColor" strokeWidth="1.8">
+                {/* Pulsing ring while recording */}
+                {recording && (
+                  <span
+                    style={{
+                      position: "absolute",
+                      inset: "-4px",
+                      borderRadius: "13px",
+                      border: "2px solid #ff6b6b",
+                      animation: "pulse 1.2s ease-out infinite",
+                      pointerEvents: "none",
+                    }}
+                  />
+                )}
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill={recording ? "#ff6b6b" : "none"}
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                >
                   <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                   <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
                   <line x1="12" y1="19" x2="12" y2="23" />
@@ -475,15 +585,15 @@ export default function Home() {
               {/* Send button */}
               <button
                 onClick={handleSubmit}
-                disabled={loading || !question.trim()}
+                disabled={!canSend}
                 style={{
                   padding: "0 20px",
                   height: "38px",
                   borderRadius: "10px",
                   border: "none",
-                  background: loading || !question.trim() ? "#2c2c2e" : "#4a4a4c",
-                  color: loading || !question.trim() ? "#555" : "#e5e5e5",
-                  cursor: loading || !question.trim() ? "not-allowed" : "pointer",
+                  background: canSend ? "#4a4a4c" : "#2c2c2e",
+                  color: canSend ? "#e5e5e5" : "#555",
+                  cursor: canSend ? "pointer" : "not-allowed",
                   fontSize: "13px",
                   fontWeight: 600,
                   display: "flex",
@@ -508,7 +618,7 @@ export default function Home() {
         {/* ── RIGHT: Images ── */}
         <div
           style={{
-            width: "500px",
+            width: "260px",
             flexShrink: 0,
             display: "flex",
             flexDirection: "column",
@@ -787,9 +897,13 @@ export default function Home() {
           0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
           40% { transform: translateY(-5px); opacity: 1; }
         }
+        @keyframes pulse {
+          0%   { opacity: 0.8; transform: scale(1); }
+          100% { opacity: 0;   transform: scale(1.35); }
+        }
         textarea:focus { border-color: #4a4a4c !important; }
-        input:focus { border-color: #4a4a4c !important; }
-        ::-webkit-scrollbar { width: 4px; }
+        input:focus    { border-color: #4a4a4c !important; }
+        ::-webkit-scrollbar       { width: 4px; }
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #3a3a3c; border-radius: 2px; }
       `}</style>
