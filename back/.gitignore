@@ -1,6 +1,6 @@
 assets
 .env
 __pycache__
-ckpt
+t2s_ckpt
 test.ipynb
 README.md

@@ -60,10 +60,10 @@ class LLM:
         if isinstance(image, dict) and "base64" in image:
             b64 = image["base64"]
             mime = image.get("mime_type", "image/jpeg")
-
+        elif isinstance(image, str) and image.startswith("data:"):  # ← ADD THIS
+            mime, b64 = image.split(";base64,")[0].split("data:")[1], image.split(";base64,")[1]
         elif isinstance(image, str) and image.startswith("http"):
             b64, mime = self._url_to_base64(image)
-
         else:
             b64, mime = self._image_to_base64(image)
 
