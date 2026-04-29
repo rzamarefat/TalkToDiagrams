@@ -1,17 +1,24 @@
 from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 from LLM import LLM
+from SpeechToText import SpeechToText
 
 app = Flask(__name__)
 CORS(app)
 
 agent = LLM(model="gpt-4o-mini")
-
+speech2txt = SpeechToText()
 
 def generate_response(question, images):
     """Generator function for streaming response."""
     for chunk in agent.chat_stream(question, images):
         yield chunk
+
+
+def convert_speech2text():
+    res = speech2txt.transcribe(r".\assets\my_sample_en_de.m4a")
+    print(res)
+
 
 
 @app.route("/", methods=["GET"])

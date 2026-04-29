@@ -7,8 +7,3 @@ class SpeechToText:
     def transcribe(self, file_path):
         result = self.model.transcribe(file_path)
         return result["text"]
-
-if __name__ == "__main__":
-    s = SpeechToText()
-    res = s.transcribe(r".\assets\my_sample_en_de.m4a")
-    print(res)
