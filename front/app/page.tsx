@@ -11,7 +11,8 @@ type Tab = {
   id: string;
   label: string;
   messages: Message[];
-  images: string[];
+  images: string[];      // server paths → sent to backend
+  imageUrls: string[];   // http URLs   → shown in carousel
   carouselIndex: number;
 };
 
@@ -21,6 +22,7 @@ function createTab(index: number): Tab {
     label: `Chat ${index}`,
     messages: [],
     images: [],
+    imageUrls: [],
     carouselIndex: 0,
   };
 }
@@ -110,8 +112,6 @@ export default function Home() {
     const audioBlob = pendingAudioRef.current;
     if (!question.trim() && !audioBlob) return;
 
-    const displayText = question.trim() || "🎤 Voice message";
-    const userMessage: Message = { role: "user", content: displayText };
     const tabId = activeTabId;
     const currentImages = activeTab.images;
     const currentQuestion = question;
@@ -121,24 +121,58 @@ export default function Home() {
     setQuestion("");
     forceUpdate((n) => n + 1);
 
-    updateTab(tabId, (t) => ({
-      ...t,
-      messages: [...t.messages, userMessage, { role: "assistant", content: "" }],
-    }));
-
     setLoading(true);
 
+    let finalQuestion = currentQuestion;
+
     if (audioBlob) {
-      // Multipart POST: backend transcribes audio first, then streams LLM response
-      await streamResponse(tabId, () => {
+      // Step 1: show placeholder while transcribing
+      updateTab(tabId, (t) => ({
+        ...t,
+        messages: [
+          ...t.messages,
+          { role: "user", content: "🎤 Transcribing…" },
+          { role: "assistant", content: "" },
+        ],
+      }));
+
+      // Step 2: transcribe audio
+      try {
         const form = new FormData();
-        form.append("question", currentQuestion);
-        currentImages.forEach((img) => form.append("images", img));
         form.append("audio", audioBlob, "recording.webm");
-        return fetch("http://localhost:5000/analyze", { method: "POST", body: form });
+        const res = await fetch("http://localhost:5000/transcribe", { method: "POST", body: form });
+        const { text } = await res.json();
+        finalQuestion = currentQuestion ? `${text}\n${currentQuestion}` : text;
+      } catch {
+        finalQuestion = currentQuestion || "🎤 Voice message";
+      }
+
+      // Step 3: update user message bubble with actual transcription
+      updateTab(tabId, (t) => {
+        const updated = [...t.messages];
+        updated[updated.length - 2] = { role: "user", content: finalQuestion };
+        return { ...t, messages: updated };
       });
+
+      // Step 4: stream LLM response with transcription as text
+      await streamResponse(tabId, () =>
+        fetch("http://localhost:5000/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: finalQuestion, images: currentImages }),
+        })
+      );
     } else {
-      // Plain JSON POST: no audio
+      // Plain text: add messages and stream directly
+      updateTab(tabId, (t) => ({
+        ...t,
+        messages: [
+          ...t.messages,
+          { role: "user", content: currentQuestion },
+          { role: "assistant", content: "" },
+        ],
+      }));
+
       await streamResponse(tabId, () =>
         fetch("http://localhost:5000/analyze", {
           method: "POST",
@@ -162,29 +196,34 @@ export default function Home() {
     if (!imageInput.trim()) return;
     updateTab(activeTabId, (t) => ({
       ...t,
-      images: [...t.images, imageInput.trim()],
+      images: [...t.images, imageInput.trim()],      // path/url for LLM
+      imageUrls: [...t.imageUrls, imageInput.trim()], // same url for carousel
       carouselIndex: t.images.length,
     }));
     setImageInput("");
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files) return;
-    Array.from(files).forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        const dataUrl = ev.target?.result as string;
-        updateTab(activeTabId, (t) => ({
-          ...t,
-          images: [...t.images, dataUrl],
-          carouselIndex: t.images.length,
-        }));
-      };
-      reader.readAsDataURL(file);
-    });
-    e.target.value = "";
-  };
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const files = e.target.files;
+  if (!files) return;
+  for (const file of Array.from(files)) {
+    const form = new FormData();
+    form.append("image", file);
+    try {
+      const res = await fetch("http://localhost:5000/upload_image", { method: "POST", body: form });
+      const { path, url } = await res.json();
+      updateTab(activeTabId, (t) => ({
+        ...t,
+        images: [...t.images, path],
+        imageUrls: [...t.imageUrls, url],
+        carouselIndex: t.images.length,
+      }));
+    } catch {
+      alert("Image upload failed.");
+    }
+  }
+  e.target.value = "";
+};
 
   const handleCarousel = (dir: 1 | -1) => {
     updateTab(activeTabId, (t) => ({
@@ -194,15 +233,17 @@ export default function Home() {
   };
 
   const removeImage = (idx: number) => {
-    updateTab(activeTabId, (t) => {
-      const imgs = t.images.filter((_, i) => i !== idx);
-      return {
-        ...t,
-        images: imgs,
-        carouselIndex: Math.min(t.carouselIndex, Math.max(0, imgs.length - 1)),
-      };
-    });
-  };
+  updateTab(activeTabId, (t) => {
+    const images = t.images.filter((_, i) => i !== idx);
+    const imageUrls = t.imageUrls.filter((_, i) => i !== idx);
+    return {
+      ...t,
+      images,
+      imageUrls,
+      carouselIndex: Math.min(t.carouselIndex, Math.max(0, images.length - 1)),
+    };
+  });
+};
 
   const discardAudio = () => {
     pendingAudioRef.current = null;
@@ -485,7 +526,7 @@ export default function Home() {
                   <line x1="12" y1="19" x2="12" y2="23" />
                   <line x1="8" y1="23" x2="16" y2="23" />
                 </svg>
-                <span>Voice recording ready — will be transcribed on send</span>
+                <span>Voice recording ready</span>
                 <button
                   onClick={discardAudio}
                   title="Discard recording"
@@ -618,7 +659,7 @@ export default function Home() {
         {/* ── RIGHT: Images ── */}
         <div
           style={{
-            width: "260px",
+            width: "500px",
             flexShrink: 0,
             display: "flex",
             flexDirection: "column",
@@ -683,7 +724,7 @@ export default function Home() {
               ) : (
                 <>
                   <img
-                    src={activeTab.images[activeTab.carouselIndex]}
+                    src={activeTab.imageUrls[activeTab.carouselIndex]}   // ← was activeTab.images[...]
                     alt={`Image ${activeTab.carouselIndex + 1}`}
                     style={{
                       maxWidth: "100%",
