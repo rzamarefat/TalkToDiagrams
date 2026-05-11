@@ -51,6 +51,37 @@ export default function Home() {
   );
 
   useEffect(() => {
+    const load = async () => {
+      try {
+        const res = await fetch("http://localhost:5000/conversations");
+        const convs: { id: string; label: string }[] = await res.json();
+        if (!convs.length) return;
+
+        const loadedTabs = await Promise.all(
+          convs.map(async (conv) => {
+            const msgRes = await fetch(`http://localhost:5000/conversations/${conv.id}/messages`);
+            const msgs: { role: string; content: string }[] = await msgRes.json();
+            return {
+              id: conv.id,
+              label: conv.label || "Chat",
+              messages: msgs.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+              images: [],
+              imageUrls: [],
+              carouselIndex: 0,
+            } as Tab;
+          })
+        );
+
+        setTabs(loadedTabs);
+        setActiveTabId(loadedTabs[0].id);
+      } catch {
+        // keep default empty tab on error
+      }
+    };
+    load();
+  }, []);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeTab?.messages]);
 
@@ -61,7 +92,7 @@ export default function Home() {
     setQuestion("");
   };
 
-  const removeTab = (id: string, e: React.MouseEvent) => {
+  const removeTab = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (tabs.length === 1) return;
     const idx = tabs.findIndex((t) => t.id === id);
@@ -69,6 +100,11 @@ export default function Home() {
     setTabs(newTabs);
     if (activeTabId === id) {
       setActiveTabId(newTabs[Math.max(0, idx - 1)].id);
+    }
+    try {
+      await fetch(`http://localhost:5000/conversations/${id}`, { method: "DELETE" });
+    } catch {
+      // UI already updated; DB delete is best-effort
     }
   };
 
@@ -113,6 +149,7 @@ export default function Home() {
     if (!question.trim() && !audioBlob) return;
 
     const tabId = activeTabId;
+    const tabLabel = activeTab.label;
     const currentImages = activeTab.images;
     const currentQuestion = question;
 
@@ -159,7 +196,7 @@ export default function Home() {
         fetch("http://localhost:5000/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question: finalQuestion, images: currentImages }),
+          body: JSON.stringify({ question: finalQuestion, images: currentImages, conversation_id: tabId, label: tabLabel }),
         })
       );
     } else {
@@ -177,7 +214,7 @@ export default function Home() {
         fetch("http://localhost:5000/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question: currentQuestion, images: currentImages }),
+          body: JSON.stringify({ question: currentQuestion, images: currentImages, conversation_id: tabId, label: tabLabel }),
         })
       );
     }
