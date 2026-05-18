@@ -1,3 +1,4 @@
+import io
 import os
 import torch
 import soundfile as sf
@@ -13,15 +14,23 @@ class TextToSpeech:
         device: str = None,
         sample_rate: int = 24000,
     ):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if device:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
         self.sample_rate = sample_rate
 
         # Load models
         self.snac = SNAC.from_pretrained(snac_model_name).to("cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        dtype_map = {"cuda": torch.bfloat16, "mps": torch.float16, "cpu": torch.float32}
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32
+            torch_dtype=dtype_map.get(self.device, torch.float32)
         ).to(self.device)
 
         # Special tokens
@@ -109,12 +118,10 @@ class TextToSpeech:
         results = []
 
         for row in cropped_tensor:
-            row = row[row != 128258]  # remove EOS-like token
-
+            row = row[row != 128258]        # remove EOS token
             length = (row.size(0) // 7) * 7
             row = row[:length]
-
-            row = [t - 128266 for t in row]
+            row = (row - 128266).tolist()   # vectorized subtract, then move to CPU once
             results.append(row)
 
         return results
@@ -157,6 +164,23 @@ class TextToSpeech:
 
             sf.write(path, audio_np, self.sample_rate)
             print(f"Saved: {path}")
+
+    # -------------------------
+    # Bytes synthesis (single text → WAV bytes, no disk I/O)
+    # -------------------------
+    def synthesize_bytes(self, text: str, voice: str = "tara") -> bytes:
+        modified = self.build_inputs([text], voice)
+        padded, mask = self.pad_inputs(modified)
+        generated = self.generate(padded, mask)
+        cropped = self.crop_after_token(generated)
+        processed = self.process_rows(cropped)
+        samples = self.decode_all(processed)
+        if not samples:
+            return b""
+        audio_np = samples[0].squeeze().cpu().detach().numpy()
+        buf = io.BytesIO()
+        sf.write(buf, audio_np, self.sample_rate, format="WAV")
+        return buf.getvalue()
 
     # -------------------------
     # Full pipeline

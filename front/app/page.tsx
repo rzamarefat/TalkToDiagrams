@@ -110,7 +110,8 @@ export default function Home() {
 
   const streamResponse = async (
     tabId: string,
-    fetchCall: () => Promise<Response>
+    fetchCall: () => Promise<Response>,
+    audioCtx?: AudioContext
   ) => {
     try {
       const res = await fetchCall();
@@ -118,19 +119,84 @@ export default function Home() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
-      let done = false;
-      let accumulatedText = "";
 
-      while (!done) {
-        const { value, done: doneReading } = await reader.read();
-        done = doneReading;
-        accumulatedText += decoder.decode(value || new Uint8Array(), { stream: true });
+      if (audioCtx) {
+        // SSE mode — resolve (unblock UI) on text_done, keep reading audio in background
+        let resolveText!: () => void;
+        const textDone = new Promise<void>((r) => { resolveText = r; });
+        let textResolved = false;
 
-        updateTab(tabId, (t) => {
-          const updated = [...t.messages];
-          updated[updated.length - 1] = { role: "assistant", content: accumulatedText };
-          return { ...t, messages: updated };
-        });
+        (async () => {
+          let sseBuffer = "";
+          let accumulatedText = "";
+          let done = false;
+          let playChain = Promise.resolve();
+
+          const enqueueAudio = (b64: string) => {
+            playChain = playChain.then(async () => {
+              try {
+                const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+                const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
+                await new Promise<void>((resolve) => {
+                  const src = audioCtx.createBufferSource();
+                  src.buffer = audioBuffer;
+                  src.connect(audioCtx.destination);
+                  src.onended = () => resolve();
+                  src.start();
+                });
+              } catch { /* skip unplayable chunk */ }
+            });
+          };
+
+          while (!done) {
+            const { value, done: doneReading } = await reader.read();
+            done = doneReading;
+            sseBuffer += decoder.decode(value || new Uint8Array(), { stream: true });
+
+            const lines = sseBuffer.split("\n");
+            sseBuffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              try {
+                const event = JSON.parse(line.slice(6));
+                if (event.type === "text") {
+                  accumulatedText += event.content;
+                  updateTab(tabId, (t) => {
+                    const updated = [...t.messages];
+                    updated[updated.length - 1] = { role: "assistant", content: accumulatedText };
+                    return { ...t, messages: updated };
+                  });
+                } else if (event.type === "text_done" && !textResolved) {
+                  textResolved = true;
+                  resolveText();
+                } else if (event.type === "audio" && event.data) {
+                  enqueueAudio(event.data);
+                }
+              } catch { /* skip malformed event */ }
+            }
+          }
+
+          if (!textResolved) resolveText(); // fallback if text_done never arrived
+          await playChain;
+          audioCtx.close();
+        })();
+
+        await textDone; // unblocks handleSubmit as soon as text is done
+      } else {
+        // Plain text streaming (existing behaviour)
+        let accumulatedText = "";
+        let done = false;
+        while (!done) {
+          const { value, done: doneReading } = await reader.read();
+          done = doneReading;
+          accumulatedText += decoder.decode(value || new Uint8Array(), { stream: true });
+          updateTab(tabId, (t) => {
+            const updated = [...t.messages];
+            updated[updated.length - 1] = { role: "assistant", content: accumulatedText };
+            return { ...t, messages: updated };
+          });
+        }
       }
     } catch {
       updateTab(tabId, (t) => {
@@ -163,6 +229,9 @@ export default function Home() {
     let finalQuestion = currentQuestion;
 
     if (audioBlob) {
+      // Unlock AudioContext NOW, inside the user-gesture handler
+      const audioCtx = new AudioContext();
+
       // Step 1: show placeholder while transcribing
       updateTab(tabId, (t) => ({
         ...t,
@@ -191,13 +260,14 @@ export default function Home() {
         return { ...t, messages: updated };
       });
 
-      // Step 4: stream LLM response with transcription as text
+      // Step 4: stream LLM response with TTS; pass unlocked AudioContext
       await streamResponse(tabId, () =>
         fetch("http://localhost:5000/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question: finalQuestion, images: currentImages, conversation_id: tabId, label: tabLabel }),
-        })
+          body: JSON.stringify({ question: finalQuestion, images: currentImages, conversation_id: tabId, label: tabLabel, voice_response: true }),
+        }),
+        audioCtx
       );
     } else {
       // Plain text: add messages and stream directly

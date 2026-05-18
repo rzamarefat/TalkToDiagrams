@@ -4,7 +4,10 @@ from LLM import LLM
 from SpeechToText import SpeechToText
 from TextToSpeech import TextToSpeech
 from database import init_db, ensure_conversation, save_message, get_messages, get_conversations, delete_conversation
+import base64
 import os
+import re
+import threading
 import time
 import json
 import uuid
@@ -18,6 +21,18 @@ init_db()
 agent = LLM(model="gpt-4o-mini")
 speech2txt = SpeechToText()
 
+_tts_model_path = os.getenv(
+    "TTS_MODEL_PATH",
+    os.path.join(os.path.dirname(__file__), "t2s_ckpt"),
+)
+try:
+    tts = TextToSpeech(model_path=_tts_model_path)
+except Exception as _e:
+    print(f"TTS initialization failed: {_e}")
+    tts = None
+
+_SENTENCE_RE = re.compile(r'(?<=[.!?\n])\s+')
+
 
 def generate_and_save(question, images, conversation_id):
     """Stream LLM chunks and persist the full exchange to the DB."""
@@ -29,9 +44,61 @@ def generate_and_save(question, images, conversation_id):
     save_message(conversation_id, "assistant", "".join(accumulated))
 
 
+def generate_with_voice(question, images, conversation_id):
+    """SSE stream: text events while TTS runs in parallel, then audio events."""
+    save_message(conversation_id, "user", question)
+    accumulated = []
+    tts_results = {}
+    tts_threads = []
+    next_idx = [0]
+
+    def _run_tts(idx, text):
+        try:
+            tts_results[idx] = tts.synthesize_bytes(text)
+        except Exception:
+            tts_results[idx] = b""
+
+    sentence_buf = ""
+    for chunk in agent.chat_stream(question, images):
+        accumulated.append(chunk)
+        sentence_buf += chunk
+        yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+
+        parts = _SENTENCE_RE.split(sentence_buf)
+        if len(parts) > 1:
+            for sentence in parts[:-1]:
+                s = sentence.strip()
+                if s and tts is not None:
+                    i = next_idx[0]
+                    next_idx[0] += 1
+                    t = threading.Thread(target=_run_tts, args=(i, s), daemon=True)
+                    t.start()
+                    tts_threads.append((i, t))
+            sentence_buf = parts[-1]
+
+    if sentence_buf.strip() and tts is not None:
+        i = next_idx[0]
+        t = threading.Thread(target=_run_tts, args=(i, sentence_buf.strip()), daemon=True)
+        t.start()
+        tts_threads.append((i, t))
+
+    save_message(conversation_id, "assistant", "".join(accumulated))
+    yield f"data: {json.dumps({'type': 'text_done'})}\n\n"
+
+    for i, t in tts_threads:
+        t.join(timeout=60)
+        audio_bytes = tts_results.get(i, b"")
+        if audio_bytes:
+            audio_b64 = base64.b64encode(audio_bytes).decode()
+            yield f"data: {json.dumps({'type': 'audio', 'data': audio_b64})}\n\n"
+
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
 @app.route("/", methods=["GET"])
 def home():
     return "Flask LLM App is running!"
+
 
 
 UPLOAD_FOLDER = "./assets/uploads"
@@ -71,11 +138,13 @@ def transcribe():
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    voice_response = False
     if request.content_type and "multipart/form-data" in request.content_type:
         question = request.form.get("question", "You can see a plot in the provided image. Please explain the curves.")
         images = json.loads(request.form.get("images", "[]"))
         conversation_id = request.form.get("conversation_id", uuid.uuid4().hex)
         label = request.form.get("label", "")
+        voice_response = request.form.get("voice_response", "false").lower() == "true"
 
         audio_file = request.files.get("audio")
         if audio_file:
@@ -88,8 +157,16 @@ def analyze():
         images = data.get("images", ["./assets/normal.png"])
         conversation_id = data.get("conversation_id", uuid.uuid4().hex)
         label = data.get("label", "")
+        voice_response = data.get("voice_response", False)
 
     ensure_conversation(conversation_id, label)
+
+    if voice_response:
+        return Response(
+            generate_with_voice(question, images, conversation_id),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     return Response(generate_and_save(question, images, conversation_id), mimetype="text/plain")
 
 
